@@ -347,6 +347,8 @@ func (cfg Config) fetchCloudConfig() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Unable to construct request for cloud config at %s: %s", url, err)
 	}
+	// Prevents intermediate nodes (CloudFlare) from caching the content
+	req.Header.Set("Cache-Control", "no-cache")
 	if lastCloudConfigETag[url] != "" {
 		// Don't bother fetching if unchanged
 		req.Header.Set(ifNoneMatch, lastCloudConfigETag[url])

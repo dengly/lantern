@@ -8,13 +8,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync/atomic"
 	"time"
 
 	"code.google.com/p/go-uuid/uuid"
 
 	"github.com/getlantern/appdir"
+	"github.com/getlantern/deepcopy"
 	"github.com/getlantern/fronted"
 	"github.com/getlantern/golog"
 	"github.com/getlantern/launcher"
@@ -103,13 +103,12 @@ func Init(version string) (*Config, error) {
 				return
 			}
 
-			var bytes []byte
-			if bytes, err = cfg.fetchCloudConfig(); err == nil {
-				if bytes != nil {
+			if newCfg, err := fetchCloudConfig(cfg.CloudConfig); err == nil {
+				if newCfg != nil {
 					mutate = func(ycfg yamlconf.Config) error {
 						log.Debugf("Merging cloud configuration")
 						cfg := ycfg.(*Config)
-						return cfg.updateFrom(bytes)
+						return cfg.updateFrom(newCfg)
 					}
 				} else {
 					log.Errorf("Nil bytes?")
@@ -340,8 +339,15 @@ func (cfg Config) cloudPollSleepTime() time.Duration {
 	return time.Duration((CloudConfigPollInterval.Nanoseconds() / 2) + rand.Int63n(CloudConfigPollInterval.Nanoseconds()))
 }
 
-func (cfg Config) fetchCloudConfig() ([]byte, error) {
-	url := cfg.CloudConfig
+// updateFrom creates a new Config by 'merging' the given yaml into this Config.
+// The masquerade sets, the collections of servers, and the trusted CAs in the
+// update yaml  completely replace the ones in the original Config.
+func (updated *Config) updateFrom(newCfg *Config) error {
+	// XXX: does this need a mutex, along with everyone that uses the config?
+	return deepcopy.Copy(updated, newCfg)
+}
+
+func fetchCloudConfig(url string) (*Config, error) {
 	log.Debugf("Checking for cloud configuration at: %s", url)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -376,47 +382,22 @@ func (cfg Config) fetchCloudConfig() ([]byte, error) {
 		return nil, fmt.Errorf("Unexpected response status: %d", resp.StatusCode)
 	}
 
-	lastCloudConfigETag[url] = resp.Header.Get(etag)
 	gzReader, err := gzip.NewReader(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to open gzip reader: %s", err)
 	}
 	log.Debugf("Fetched cloud config")
-	return ioutil.ReadAll(gzReader)
-}
 
-// updateFrom creates a new Config by 'merging' the given yaml into this Config.
-// The masquerade sets, the collections of servers, and the trusted CAs in the
-// update yaml  completely replace the ones in the original Config.
-func (updated *Config) updateFrom(updateBytes []byte) error {
-	// XXX: does this need a mutex, along with everyone that uses the config?
-	oldFrontedServers := updated.Client.FrontedServers
-	oldChainedServers := updated.Client.ChainedServers
-	oldMasqueradeSets := updated.Client.MasqueradeSets
-	oldTrustedCAs := updated.TrustedCAs
-	updated.Client.FrontedServers = []*client.FrontedServerInfo{}
-	updated.Client.ChainedServers = map[string]*client.ChainedServerInfo{}
-	updated.Client.MasqueradeSets = map[string][]*fronted.Masquerade{}
-	updated.TrustedCAs = []*CA{}
-	err := yaml.Unmarshal(updateBytes, updated)
+	bytes, err := ioutil.ReadAll(gzReader)
 	if err != nil {
-		updated.Client.FrontedServers = oldFrontedServers
-		updated.Client.ChainedServers = oldChainedServers
-		updated.Client.MasqueradeSets = oldMasqueradeSets
-		updated.TrustedCAs = oldTrustedCAs
-		return fmt.Errorf("Unable to unmarshal YAML for update: %s", err)
+		return nil, fmt.Errorf("Unable to read from gzip reader: %s", err)
 	}
-	// Deduplicate global proxiedsites
-	if len(updated.ProxiedSites.Cloud) > 0 {
-		wlDomains := make(map[string]bool)
-		for _, domain := range updated.ProxiedSites.Cloud {
-			wlDomains[domain] = true
-		}
-		updated.ProxiedSites.Cloud = make([]string, 0, len(wlDomains))
-		for domain, _ := range wlDomains {
-			updated.ProxiedSites.Cloud = append(updated.ProxiedSites.Cloud, domain)
-		}
-		sort.Strings(updated.ProxiedSites.Cloud)
+	newCfg := &Config{}
+	err = yaml.Unmarshal(bytes, newCfg)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to unmarshal YAML for update: %s", err)
 	}
-	return nil
+
+	lastCloudConfigETag[url] = resp.Header.Get(etag)
+	return newCfg, nil
 }

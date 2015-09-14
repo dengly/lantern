@@ -191,19 +191,22 @@ func Init(version string) (*Config, error) {
 				return err
 			}
 			log.Debugf("Bootstrap settings has %v chained servers", len(servers.ChainedServers))
-			clients := loadBootstrapHttpClients(servers)
+			clients, tokens := loadBootstrapHttpClients(servers)
 			url := cfg.CloudConfig
 
 			configs := make(chan []byte)
 			var once sync.Once
-			for _, client := range clients {
+			for i, client := range clients {
 				go func(httpClient *http.Client) {
-					if bytes, err := fetchCloudConfig(httpClient, url); err == nil {
-						log.Debugf("Successfully downloaded custom config")
-
-						// We just use the first config we learn about.
-						once.Do(func() { configs <- bytes })
+					bytes, err := fetchCloudConfig(httpClient, url, tokens[i])
+					if err != nil {
+						log.Errorf("Failed to download custom config: %s", err)
+						return
 					}
+					log.Debugf("Successfully downloaded custom config")
+
+					// We just use the first config we learn about.
+					once.Do(func() { configs <- bytes })
 				}(client)
 			}
 			config := <-configs
@@ -245,7 +248,8 @@ func pollWithHttpClient(currentCfg yamlconf.Config, client *http.Client) (mutate
 	}
 
 	url := cfg.CloudConfig
-	if bytes, err := fetchCloudConfig(client, url); err == nil {
+	// don't pass authToken because client already handled it
+	if bytes, err := fetchCloudConfig(client, url, ""); err == nil {
 		// bytes will be nil if the config is unchanged (not modified)
 		if bytes != nil {
 			//log.Debugf("Downloaded config:\n %v", string(bytes))
@@ -494,8 +498,9 @@ func (cfg Config) cloudPollSleepTime() time.Duration {
 	return time.Duration((CloudConfigPollInterval.Nanoseconds() / 2) + rand.Int63n(CloudConfigPollInterval.Nanoseconds()))
 }
 
-func loadBootstrapHttpClients(bs *client.BootstrapServers) []*http.Client {
+func loadBootstrapHttpClients(bs *client.BootstrapServers) ([]*http.Client, []string) {
 	var clients []*http.Client
+	var tokens []string
 	for _, s := range bs.ChainedServers {
 		log.Debugf("Fetching config using chained server: %v", s.Addr)
 		dialer, er := s.Dialer()
@@ -509,15 +514,19 @@ func loadBootstrapHttpClients(bs *client.BootstrapServers) []*http.Client {
 				Dial:              dialer.Dial,
 			},
 		})
+		tokens = append(tokens, s.AuthToken)
 	}
-	return clients
+	return clients, tokens
 }
 
-func fetchCloudConfig(client *http.Client, url string) ([]byte, error) {
+func fetchCloudConfig(client *http.Client, url string, authToken string) ([]byte, error) {
 	log.Debugf("Checking for cloud configuration at: %s", url)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to construct request for cloud config at %s: %s", url, err)
+	}
+	if authToken != "" {
+		req.Header.Set("X-LANTERN-AUTH-TOKEN", authToken)
 	}
 	if lastCloudConfigETag[url] != "" {
 		// Don't bother fetching if unchanged
